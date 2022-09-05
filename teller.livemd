@@ -1,0 +1,244 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# Teller Bank Challenge
+
+```elixir
+Mix.install([:req, :jason, :kino])
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## Your Solution
+
+```elixir
+username = Kino.Input.text("Username") |> Kino.render()
+password = Kino.Input.text("Password")
+```
+
+```elixir
+defmodule TellerBank do
+  defmodule OTPCode do
+    @moduledoc """
+    You can use this util module to generate your OTP
+    code dynamically.
+    """
+
+    @type username() :: String.t()
+
+    @spec generate(username) :: String.t()
+    def generate(username) do
+      username
+      |> String.to_charlist()
+      |> Enum.take(6)
+      |> Enum.map(&char_to_keypad_number/1)
+      |> List.to_string()
+      |> String.pad_leading(6, "0")
+    end
+
+    defp char_to_keypad_number(c) when c in ~c(a b c), do: '2'
+    defp char_to_keypad_number(c) when c in ~c(d e f), do: '3'
+    defp char_to_keypad_number(c) when c in ~c(g h i), do: '4'
+    defp char_to_keypad_number(c) when c in ~c(j k l), do: '5'
+    defp char_to_keypad_number(c) when c in ~c(m n o), do: '6'
+    defp char_to_keypad_number(c) when c in ~c(p q r s), do: '7'
+    defp char_to_keypad_number(c) when c in ~c(t u v), do: '8'
+    defp char_to_keypad_number(c) when c in ~c(w x y z), do: '9'
+    defp char_to_keypad_number(_), do: '0'
+  end
+
+  defmodule ChallengeResult do
+    @type t :: %__MODULE__{
+            account_number: String.t(),
+            balance_in_cents: integer
+          }
+    defstruct [:account_number, :balance_in_cents]
+  end
+
+  defmodule Client do
+    @url "https://challenge.teller.engineering"
+    @api_key "HowManyDevsDoesItTakeToConnectAMacbookToAProjector?"
+    @user_agent "Teller Bank iOS 1.1"
+    @device_id "GWBZHHAS2UHT45IO"
+    @app_json "application/json"
+    @teller_hire "I know!"
+
+    @type username() :: String.t()
+    @type password() :: String.t()
+
+    @spec fetch(username, password) :: ChallengeResult.t()
+    def fetch(username, password) do
+      base_headers = [
+        user_agent: @user_agent,
+        api_key: @api_key,
+        device_id: @device_id,
+        content_type: @app_json,
+        accept: @app_json,
+        teller_is_hiring: @teller_hire
+      ]
+
+      # Initial Login Request
+      body = get_login_body(username, password)
+
+      %Req.Response{headers: resp_headers, body: login_body} =
+        Req.post!("#{@url}/login", body: body, headers: base_headers)
+
+      mfa_body = get_sms_body(login_body)
+      mfa_headers = update_headers(base_headers, resp_headers, username)
+
+      # Start SMS 2FA flow
+      %Req.Response{headers: mfa_resp_headers, body: _body} =
+        Req.post!("#{@url}/login/mfa/request", body: mfa_body, headers: mfa_headers)
+
+      mfa_login_headers = update_headers(base_headers, mfa_resp_headers, username)
+      otp_body = get_otp_code_body(username)
+
+      # Send OTP Code to SMS flow
+      %Req.Response{headers: otp_resp_headers, body: body} =
+        Req.post!("#{@url}/login/mfa", body: otp_body, headers: mfa_login_headers)
+
+      # Now you are logged in
+
+      # Get the key to decrypt the account number
+      session_key =
+        body["enc_session_key"]
+        |> Base.decode64!()
+        |> Jason.decode!()
+
+      # Get the account id
+      [%{"id" => account_id} | _] = body["accounts"]["checking"]
+
+      balance_headers = update_headers(base_headers, otp_resp_headers, username)
+
+      # Send GET request for balance 
+      %Req.Response{headers: balance_headers, body: body} =
+        Req.get!("#{@url}/accounts/#{account_id}/balances", headers: balance_headers)
+
+      # Get balance here
+      balance = body["available"]
+
+      details_headers = update_headers(base_headers, balance_headers, username)
+
+      # Send GET for account details 
+      %Req.Response{body: body} =
+        Req.get!("#{@url}/accounts/#{account_id}/details", headers: details_headers)
+
+      ciphertext_base = body["number"]
+
+      # Hope the aes settings don't change like the f_token lol
+      secret_key = Base.decode64!(session_key["key"])
+      ciphertext = Base.decode64!(ciphertext_base)
+
+      raw_decrypt = :crypto.crypto_one_time(:aes_128_ecb, secret_key, ciphertext, false)
+
+      # Pattern matching is great 
+      <<_h::binary-16, account_number::binary-12, _t::binary>> = raw_decrypt
+
+      %TellerBank.ChallengeResult{
+        account_number: account_number,
+        balance_in_cents: balance
+      }
+    end
+
+    def get_login_body(username, password) do
+      %{
+        username: username,
+        password: password
+      }
+      |> Jason.encode!()
+    end
+
+    def get_sms_body(login_body) do
+      [%{"id" => sms_id} | _] = login_body["devices"]
+
+      %{
+        device_id: sms_id
+      }
+      |> Jason.encode!()
+    end
+
+    def get_otp_code_body(username) do
+      %{
+        code: TellerBank.OTPCode.generate(username)
+      }
+      |> Jason.encode!()
+    end
+
+    def update_headers(base_headers, new_headers, username) do
+      f_token = get_f_token(new_headers, username)
+      request_token = get_request_token(new_headers)
+
+      base_headers
+      |> Keyword.put(:request_token, request_token)
+      |> Keyword.put(:f_token, f_token)
+    end
+
+    def get_f_token(resp_headers, username) do
+      f_spec =
+        get_f_spec(resp_headers)
+        |> Base.decode64!(padding: false)
+        |> Jason.decode!()
+
+      separator = f_spec["separator"]
+      f_values = Enum.reverse(f_spec["values"])
+      req_id = get_req_id(resp_headers)
+
+      f_token_string = get_f_token_string(separator, f_values, username, req_id)
+
+      :crypto.hash(:sha3_256, f_token_string)
+      |> Base.encode32()
+      |> String.downcase()
+      |> String.trim_trailing("=")
+    end
+
+    def get_f_token_string(sep, f_values, username, req_id) do
+      Enum.reduce(f_values, "", fn v, acc ->
+        get_f_value(v, username, req_id) <> sep <> acc
+      end)
+      |> String.trim_trailing(sep)
+    end
+
+    def get_f_value(v, username, req_id) do
+      case v do
+        "device-id" ->
+          @device_id
+
+        "api-key" ->
+          @api_key
+
+        "username" ->
+          username
+
+        "last-request-id" ->
+          req_id
+      end
+    end
+
+    def get_request_token(resp_headers) do
+      Map.new(resp_headers)["request-token"]
+    end
+
+    def get_req_id(resp_headers) do
+      Map.new(resp_headers)["f-request-id"]
+    end
+
+    def get_f_spec(resp_headers) do
+      Map.new(resp_headers)["f-token-spec"]
+    end
+  end
+end
+
+username = Kino.Input.read(username)
+password = Kino.Input.read(password)
+
+TellerBank.Client.fetch(username, password)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+%TellerBank.ChallengeResult{account_number: "877283704086", balance_in_cents: 48864}
+```
